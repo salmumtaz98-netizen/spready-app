@@ -145,14 +145,22 @@ def calculate_rotce_metrics(ticker_symbol, rf_rate, market_return=0.10):
 
     if fin.empty or bs.empty: return None
 
-    # 1. Numerator Adjustment: Find Amortization & Add to EBIT
+    # --- 1. MAXIMUM PRECISION NOPAT ---
     ebit = fin.loc['EBIT'].iloc[0] if 'EBIT' in fin.index else 0
+    
+    # Cap effective tax rates to avoid wild one-off accounting anomalies distorting NOPAT
     try:
         pretax = fin.loc['Pretax Income'].iloc[0]
         tax_prov = fin.loc['Tax Provision'].iloc[0]
-        tax_rate = tax_prov / pretax if pretax > 0 else 0.21
-    except: tax_rate = 0.21
+        calculated_tax = tax_prov / pretax if pretax > 0 else 0.21
+        tax_rate = max(0.0, min(calculated_tax, 0.35)) # Bound between 0% and 35%
+    except: 
+        tax_rate = 0.21
 
+    # Base operating earnings after real cash taxes
+    nopat = ebit * (1 - tax_rate)
+
+    # Find non-cash amortization
     amortization = 0
     if not cf.empty:
         if 'Amortization' in cf.index and not pd.isna(cf.loc['Amortization'].iloc[0]):
@@ -160,13 +168,18 @@ def calculate_rotce_metrics(ticker_symbol, rf_rate, market_return=0.10):
         elif 'Amortization Of Intangibles' in cf.index and not pd.isna(cf.loc['Amortization Of Intangibles'].iloc[0]):
             amortization = cf.loc['Amortization Of Intangibles'].iloc[0]
 
-    adj_ebit = ebit + amortization
-    adj_nopat = adj_ebit * (1 - tax_rate)
+    # Add back amortization POST-tax to preserve the tax shield cash benefit
+    adj_nopat = nopat + amortization
 
-    # 2. Denominator Adjustment: Strip Goodwill & Intangibles
+    # --- 2. MAXIMUM PRECISION TANGIBLE CAPITAL ---
     total_debt = bs.loc['Total Debt'].iloc[0] if 'Total Debt' in bs.index else 0
     equity = bs.loc['Stockholders Equity'].iloc[0] if 'Stockholders Equity' in bs.index else 0
-    cash = bs.loc['Cash And Cash Equivalents'].iloc[0] if 'Cash And Cash Equivalents' in bs.index else 0
+    total_cash = bs.loc['Cash And Cash Equivalents'].iloc[0] if 'Cash And Cash Equivalents' in bs.index else 0
+    revenue = fin.loc['Total Revenue'].iloc[0] if 'Total Revenue' in fin.index else 0
+    
+    # Only subtract EXCESS cash, not operating cash
+    operating_cash_needed = revenue * 0.02
+    excess_cash = max(0, total_cash - operating_cash_needed)
     
     gw_int = 0
     if 'Goodwill And Other Intangible Assets' in bs.index and not pd.isna(bs.loc['Goodwill And Other Intangible Assets'].iloc[0]):
@@ -176,14 +189,15 @@ def calculate_rotce_metrics(ticker_symbol, rf_rate, market_return=0.10):
         intan = bs.loc['Other Intangible Assets'].iloc[0] if 'Other Intangible Assets' in bs.index and not pd.isna(bs.loc['Other Intangible Assets'].iloc[0]) else 0
         gw_int = gw + intan
 
-    tangible_ic = (total_debt + equity - cash) - gw_int
+    # Base Invested Capital uses Excess Cash, then we strip out M&A intangibles
+    tangible_ic = (total_debt + equity - excess_cash) - gw_int
     
     if tangible_ic <= 0:
-        rotce = np.nan # Tangible capital is negative/zero, meaning infinite returns
+        rotce = np.nan # Tangible capital is negative (company operates on float/negative working capital)
     else:
         rotce = adj_nopat / tangible_ic
 
-    # 3. WACC Calculation (Standard)
+    # --- 3. WACC ---
     beta = float(info.get('beta', 1.0) or 1.0)
     cost_of_equity = rf_rate + beta * (market_return - rf_rate)
     interest = fin.loc['Interest Expense'].iloc[0] if 'Interest Expense' in fin.index else 0
